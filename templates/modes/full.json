@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "name": "全功能",
+  "autoLoad": "all",
+  "inherit": null,
+  "addTools": [],
+  "addSkills": [],
+  "packages": [],
+  "prompts": [],
+  "systemPrompt": ""
+}

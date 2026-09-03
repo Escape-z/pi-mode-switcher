@@ -1,0 +1,23 @@
+{
+  "name": "pi-mode-switcher",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi 模式切换系统：按需加载工具/技能/包，节省 token 消耗",
+  "keywords": ["pi-package", "mode", "token", "workflow"],
+  "scripts": {
+    "test": "node .testenv/harness.mjs && node .testenv/verify-fixes.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Escape-z/pi-mode-switcher.git"
+  },
+  "homepage": "https://github.com/Escape-z/pi-mode-switcher#readme",
+  "peerDependencies": {
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}

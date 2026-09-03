@@ -1,0 +1,8 @@
+node_modules/
+.testenv/pkg/
+.testenv/verify/
+.testenv/agent/
+.testenv/project/
+.real-test-sessions/
+*.log
+.DS_Store
