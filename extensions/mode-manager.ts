@@ -1,18 +1,18 @@
 // pi-mode-switcher · 模式管理
-// 命令：/init /addmode /editmode /delmode /modes /link /linked /unlink /cleanup
+// 命令：/mode（show/clear/use/add/edit/del/init/cleanup）与 /link（add/del/show/clear）
 // 全部管理命令仅支持交互式 TUI/RPC 模式（ctx.hasUI 守卫）
 import { join, dirname } from "node:path";
-import { existsSync, copyFileSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, copyFileSync, rmSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
-  agentDir, globalModesDir, globalSettingsFile, projectModesDir, RESERVED, DEFAULT_TOOLS, MODE_ID_RE,
-  runtime, scanModeFiles, scanModes, scanNestedModeFiles, scanSkillRefs, loadMode, loadModeConfig, saveModeConfig,
+  globalModesDir, globalSettingsFile, projectModesDir, DEFAULT_TOOLS, MODE_ID_RE,
+  runtime, bumpRuntimeRev, scanModeFiles, scanModes, scanNestedModeFiles, scanSkillRefs, loadMode, loadModeConfig, saveModeConfig,
   modeLocation, listInstalledPackages, findPackageDir, inspectPackage, isPackageResourceAllowed, getOrphanPackages, checkInheritDirection,
-  readJson, writeJson, type ModeConfig, type SkillRef, type PromptRef, type ManagedResources,
+  readJson, writeJson, type ModeConfig, type SkillRef, type PromptRef, type ManagedResources, type ManagedPackageResources,
 } from "../lib/shared.ts";
 import {
-  applyMode, effectiveStats, getBridge, registerModeCommandShared,
+  applyMode, effectiveStats,
 } from "../lib/mode-runtime.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +28,7 @@ export default function (pi: ExtensionAPI) {
 
   function syncProjectTrust(ctx: any): void {
     runtime.projectTrusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true;
+    if (typeof ctx?.cwd === "string" && ctx.cwd) runtime.cwd = ctx.cwd;
   }
 
   function hasUI(ctx: ExtensionCommandContext): boolean {
@@ -219,7 +220,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 统一维护包资源 owner。addmode/editmode/link 必须使用同一套规则，
+   * 统一维护包资源 owner。mode add/mode edit/link add 必须使用同一套规则，
    * 否则 unlink 无法判断哪些资源可以安全清理。
    */
   function reconcileManagedResources(
@@ -305,7 +306,7 @@ export default function (pi: ExtensionAPI) {
     return false;
   }
 
-  /** 立即刷新当前模式（link/unlink/editmode 后调用）。 */
+  /** 立即刷新当前模式（link add/link del/mode edit 后调用）。 */
   function refreshIfCurrent(pi: ExtensionAPI, ctx: ExtensionCommandContext, modeId: string) {
     if (runtime.currentMode === modeId) {
       const msg = applyMode(pi, ctx, modeId);
@@ -313,18 +314,90 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ---------- /init：生成内置模板 ----------
-  pi.registerCommand("init", {
-    description: "生成内置模式模板（full.json，含损坏备份修复）",
-    handler: async (_args, ctx) => {
-      if (!hasUI(ctx)) return;
-      syncProjectTrust(ctx);
-      const target = join(globalModesDir, "full.json");
-      const template = join(pkgRoot, "templates", "modes", "full.json");
-      if (!existsSync(target)) {
-        try {
-          copyFileSync(template, target);
-          ctx.ui.notify("✅ 已生成 modes/full.json（/full 即刻可用）", "info");
+  // ---------- 实时面板：脏检测 + 活体组件 ----------
+  // pi 的 setWidget 工厂只调用一次生成组件，之后每帧只重绘组件本身；
+  // 因此把数据采集放进组件 render()，配合 rev/文件指纹脏检测实现面板实时更新。
+  function dirFingerprint(dir: string): string {
+    try {
+      return readdirSync(dir)
+        .filter((f) => f.endsWith(".json"))
+        .map((f) => {
+          try { return `${f}:${statSync(join(dir, f)).mtimeMs}`; } catch { return `${f}:x`; }
+        })
+        .join(",");
+    } catch { return "-"; }
+  }
+
+  function panelSignature(cwd: string): string {
+    let settingsMtime = "-";
+    try { settingsMtime = String(statSync(globalSettingsFile).mtimeMs); } catch { /* 不存在 */ }
+    return [
+      String(runtime.rev),
+      dirFingerprint(globalModesDir),
+      runtime.projectTrusted ? dirFingerprint(projectModesDir(cwd)) : "",
+      settingsMtime,
+    ].join("|");
+  }
+
+  /**
+   * 折叠上限：优先用终端真实高度自适应（完全展示），拿不到时退回 pi 官方的 10 行。
+   * 预留 12 行给编辑器、页脚/状态区和对话区；终端 resize 会触发 requestRender，
+   * render() 重新读 rows 自动跟随。
+   */
+  const WIDGET_FALLBACK_LINES = 10;
+  const WIDGET_RESERVE_ROWS = 12;
+  const WIDGET_MIN_LINES = 4;
+  function widgetMaxLines(tui: any): number {
+    try {
+      const rows = tui?.terminal?.rows;
+      if (typeof rows === "number" && rows > 0) return Math.max(WIDGET_MIN_LINES, rows - WIDGET_RESERVE_ROWS);
+    } catch { /* ignore */ }
+    return WIDGET_FALLBACK_LINES;
+  }
+  function clampWidgetLines(lines: string[], maxLines: number): string[] {
+    if (lines.length <= maxLines) return lines;
+    if (maxLines < 4) return lines.slice(0, maxLines);
+    const visible = maxLines - 2;
+    const hidden = lines.length - visible - 1;
+    return [
+      ...lines.slice(0, visible),
+      `  …（还有 ${hidden} 行未显示，终端高度不足）`,
+      lines[lines.length - 1],
+    ];
+  }
+
+  /**
+   * 活体组件：render 时按脏检测重新采集数据。
+   * - rev（进程内变更）变化 → 立即重建
+   * - 外部变更（pi install/remove、手改 JSON）→ 文件指纹发现
+   * 指纹仅需几次 readdir/stat，每次渲染检查代价可忽略。
+   */
+  function liveWidget(tui: any, cwd: string, build: () => string[]) {
+    let lastSig = "";
+    let lines: string[] = [];
+    return {
+      render(_width: number): string[] {
+        const sig = panelSignature(cwd);
+        if (sig !== lastSig) {
+          try { lines = clampWidgetLines(build(), widgetMaxLines(tui)); lastSig = sig; } catch { /* 采集失败沿用旧内容 */ }
+        }
+        return lines;
+      },
+      invalidate() {},
+    };
+  }
+
+  // ---------- /mode init：生成内置模板 ----------
+  async function cmdInit(_args: string, ctx: ExtensionCommandContext) {
+    if (!hasUI(ctx)) return;
+    syncProjectTrust(ctx);
+    const target = join(globalModesDir, "full.json");
+    const template = join(pkgRoot, "templates", "modes", "full.json");
+    if (!existsSync(target)) {
+      try {
+        copyFileSync(template, target);
+        bumpRuntimeRev();
+        ctx.ui.notify("✅ 已生成 modes/full.json（/mode use full 即刻可用）", "info");
         } catch {
           ctx.ui.notify("❌ 模板复制失败", "error");
         }
@@ -338,6 +411,7 @@ export default function (pi: ExtensionAPI) {
           copyFileSync(target, `${target}.bak`);
           rmSync(target);
           copyFileSync(template, target);
+          bumpRuntimeRev();
           ctx.ui.notify("✅ 已备份并重新生成 modes/full.json", "info");
         } catch {
           ctx.ui.notify("❌ 修复失败", "error");
@@ -351,18 +425,16 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         copyFileSync(template, target);
+        bumpRuntimeRev();
         ctx.ui.notify("✅ 已覆盖 modes/full.json", "info");
       } catch {
         ctx.ui.notify("❌ 模板复制失败", "error");
       }
-    },
-  });
+  }
 
-  // ---------- /addmode：创建模式（创建即注册命令） ----------
-  pi.registerCommand("addmode", {
-    description: "创建新模式（先挂包，再勾选工具/技能，创建后立即可用）",
-    handler: async (_args, ctx) => {
-      if (!hasUI(ctx)) return;
+  // ---------- /mode add：创建模式 ----------
+  async function cmdAddMode(_args: string, ctx: ExtensionCommandContext) {
+    if (!hasUI(ctx)) return;
       syncProjectTrust(ctx);
       // ① 命令标识
       const id = await ctx.ui.input("命令标识 (小写字母/数字/连字符):", "");
@@ -371,16 +443,16 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("❌ 标识只允许小写字母/数字，单个连字符分段", "error");
         return;
       }
-      if (RESERVED.includes(id) && id !== "full") {
-        ctx.ui.notify(`❌ ${id} 是内置保留名，请换一个`, "error");
+      if (id === "default") {
+        ctx.ui.notify("❌ default 是虚拟内置模式，请换一个标识", "error");
         return;
       }
       if (id === "full") {
-        ctx.ui.notify("❌ full 是内置模式，请用 /editmode full 修改", "error");
+        ctx.ui.notify("❌ full 是内置模式，请用 /mode edit full 修改", "error");
         return;
       }
       if (commandExists(pi, id)) {
-        ctx.ui.notify(`❌ /${id} 已被其他命令占用，请换一个标识`, "error");
+        ctx.ui.notify(`❌ ${id} 与已有命令重名，请换一个标识`, "error");
         return;
       }
 
@@ -397,16 +469,16 @@ export default function (pi: ExtensionAPI) {
       const globalPath = join(globalModesDir, `${id}.json`);
       const projectPath = join(projectModesDir(ctx.cwd), `${id}.json`);
       if (location === "global" && (existsSync(globalPath) || existsSync(projectPath))) {
-        ctx.ui.notify(`❌ ${id} 已存在，请换名或用 /editmode`, "error");
+        ctx.ui.notify(`❌ ${id} 已存在，请换名或用 /mode edit`, "error");
         return;
       }
       if (location === "project" && existsSync(projectPath)) {
-        ctx.ui.notify(`❌ 项目级 ${id} 已存在，请换名或用 /editmode`, "error");
+        ctx.ui.notify(`❌ 项目级 ${id} 已存在，请换名或用 /mode edit`, "error");
         return;
       }
 
       // ④ 父模式（继承，含虚拟 default）
-      const modeIds = scanModes(ctx.cwd).filter((m) => !RESERVED.includes(m) && m !== id);
+      const modeIds = scanModes(ctx.cwd).filter((m) => m !== "full" && m !== id);
       const parent = await ctx.ui.select("父模式 (继承):", ["无（独立模式）", "default（虚拟根模式）", ...modeIds]);
       if (!parent) return;
       const parentId = parent.startsWith("无") ? null : parent.startsWith("default") ? "default" : parent;
@@ -500,145 +572,154 @@ export default function (pi: ExtensionAPI) {
       reconcileManagedResources(config, packages, chosenPkgs, pi, ctx.cwd);
       const dir = location === "global" ? globalModesDir : projectModesDir(ctx.cwd);
       if (!writeJson(join(dir, `${id}.json`), config)) return ctx.ui.notify("❌ 写入失败", "error");
+      bumpRuntimeRev(); // /mode show、/link show 面板实时出现新模式
 
-      // 创建即注册（决策 20）
-      registerModeCommandShared(pi, id, `切换到模式 ${id}`, async (_args2, ctx2) => {
-        const msg = applyMode(pi, ctx2, id);
-        ctx2.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
-      });
-      ctx.ui.notify(`✅ 模式「${name}」已创建，/${id} 已立即可用${prompts.length > 0 ? "；提示模板需 /reload 生效" : ""}`, "info");
-    },
-  });
+      ctx.ui.notify(`✅ 模式「${name}」已创建，/mode use ${id} 即可切换${prompts.length > 0 ? "；提示模板需 /reload 生效" : ""}`, "info");
+  }
 
-  // ---------- /modes：递归继承树 + 有效统计 + 诊断 ----------
-  pi.registerCommand("modes", {
-    description: "查看所有模式（递归继承树，当前模式高亮；/modes clear 关闭面板）",
-    handler: async (args, ctx) => {
-      syncProjectTrust(ctx);
-      if (args === "clear") {
-        ctx.ui.setWidget("modes", undefined);
-        return;
-      }
-      const { modes: files, diagnostics, nested } = scanModeFiles(ctx.cwd);
-      const modeIds = [...new Set(["default", "full", ...files.map((f) => f.id)])];
-      const configs = new Map<string, ModeConfig | null>();
-      const warningsByMode = new Map<string, string[]>();
-      for (const id of modeIds) {
-        if (id === "default") configs.set(id, null);
-        else if (id === "full") configs.set(id, loadMode("full", ctx.cwd).config ?? null);
-        else {
-          const r = loadMode(id, ctx.cwd);
-          configs.set(id, r.config);
-          if (r.broken) diagnostics.push(`modes/${id}.json：JSON 解析失败，已跳过`);
-          else warningsByMode.set(id, r.warnings);
-        }
-      }
-      const orphanModes = Object.entries(getOrphanPackages(files.map((f) => f.id), ctx.cwd));
-      if (orphanModes.length > 0) {
-        for (const [id, pkgs] of orphanModes) diagnostics.push(`/${id} 引用了已卸载的包：${pkgs.join(", ")}（运行 /cleanup 清理，/reload 清除残留代码）`);
-      }
-      if (nested.length > 0) for (const n of nested) diagnostics.push(`嵌套文件无效（不会被注册）：${n} → 请移到 modes/ 顶层`);
+  // ---------- /modes：数据采集 + 渲染（命令与活体面板共用） ----------
+  interface ModesData {
+    modeIds: string[];
+    diagnostics: string[];
+    configs: Map<string, ModeConfig | null>;
+    warningsByMode: Map<string, string[]>;
+    childrenOf: Map<string, string[]>;
+    roots: string[];
+    current: string | null;
+    stats: Map<string, ReturnType<typeof effectiveStats>>;
+  }
 
-      // 继承树（递归；default 为虚拟根）
-      const childrenOf = new Map<string, string[]>();
-      const roots: string[] = [];
-      const validParent = (pid: string | null | undefined): boolean =>
-        typeof pid === "string" && (pid === "default" || (modeIds.includes(pid) && pid !== "full"));
-      for (const id of modeIds) {
-        if (id === "default" || id === "full") continue;
-        const inh = configs.get(id)?.inherit;
-        if (validParent(inh)) {
-          const list = childrenOf.get(inh as string) ?? [];
-          list.push(id);
-          childrenOf.set(inh as string, list);
-        } else {
-          roots.push(id);
-        }
+  /** 每次调用都重新扫描磁盘/运行时，保证拿到最新数据（活体面板每帧调用）。 */
+  function collectModesData(pi: ExtensionAPI, cwd: string, readCurrent: () => string | null): ModesData {
+    const { modes: files, diagnostics, nested } = scanModeFiles(cwd);
+    const modeIds = [...new Set(["default", "full", ...files.map((f) => f.id)])];
+    const configs = new Map<string, ModeConfig | null>();
+    const warningsByMode = new Map<string, string[]>();
+    for (const id of modeIds) {
+      if (id === "default") configs.set(id, null);
+      else if (id === "full") configs.set(id, loadMode("full", cwd).config ?? null);
+      else {
+        const r = loadMode(id, cwd);
+        configs.set(id, r.config);
+        if (r.broken) diagnostics.push(`modes/${id}.json：JSON 解析失败，已跳过`);
+        else warningsByMode.set(id, r.warnings);
       }
-      // 循环继承的成员不挂在任何树上 → 追加到 roots 保证可见
-      const placed = new Set<string>(["default", "full", ...roots]);
-      const markTree = (id: string) => {
-        if (placed.has(id)) return;
-        placed.add(id);
-        for (const k of childrenOf.get(id) ?? []) markTree(k);
-      };
-      for (const r of roots) markTree(r);
-      for (const id of modeIds) {
-        if (placed.has(id)) continue;
+    }
+    const orphanModes = Object.entries(getOrphanPackages(files.map((f) => f.id), cwd));
+    if (orphanModes.length > 0) {
+      for (const [id, pkgs] of orphanModes) diagnostics.push(`/${id} 引用了已卸载的包：${pkgs.join(", ")}（运行 /mode cleanup 清理，/reload 清除残留代码）`);
+    }
+    if (nested.length > 0) for (const n of nested) diagnostics.push(`嵌套文件无效（不会被注册）：${n} → 请移到 modes/ 顶层`);
+
+    // 继承树（递归；default 为虚拟根）
+    const childrenOf = new Map<string, string[]>();
+    const roots: string[] = [];
+    const validParent = (pid: string | null | undefined): boolean =>
+      typeof pid === "string" && (pid === "default" || (modeIds.includes(pid) && pid !== "full"));
+    for (const id of modeIds) {
+      if (id === "default" || id === "full") continue;
+      const inh = configs.get(id)?.inherit;
+      if (validParent(inh)) {
+        const list = childrenOf.get(inh as string) ?? [];
+        list.push(id);
+        childrenOf.set(inh as string, list);
+      } else {
         roots.push(id);
-        markTree(id);
       }
+    }
+    // 循环继承的成员不挂在任何树上 → 追加到 roots 保证可见
+    const placed = new Set<string>(["default", "full", ...roots]);
+    const markTree = (id: string) => {
+      if (placed.has(id)) return;
+      placed.add(id);
+      for (const k of childrenOf.get(id) ?? []) markTree(k);
+    };
+    for (const r of roots) markTree(r);
+    for (const id of modeIds) {
+      if (placed.has(id)) continue;
+      roots.push(id);
+      markTree(id);
+    }
 
-      const stateCurrent = readCurrentFromBranchCompat(ctx);
-      const current = stateCurrent ?? runtime.currentMode;
-      const stats = new Map<string, ReturnType<typeof effectiveStats>>();
-      for (const id of modeIds) stats.set(id, effectiveStats(pi, id, ctx.cwd));
+    const current = readCurrent() ?? runtime.currentMode;
+    const stats = new Map<string, ReturnType<typeof effectiveStats>>();
+    for (const id of modeIds) stats.set(id, effectiveStats(pi, id, cwd));
+    return { modeIds, diagnostics, configs, warningsByMode, childrenOf, roots, current, stats };
+  }
 
+  function buildModesLines(data: ModesData, theme?: any): string[] {
+    const { modeIds, diagnostics, configs, warningsByMode, childrenOf, roots, current, stats } = data;
+    const lines: string[] = [];
+    const line = (s: string) => lines.push(s);
+    const validParent = (pid: string | null | undefined): boolean =>
+      typeof pid === "string" && (pid === "default" || (modeIds.includes(pid) && pid !== "full"));
+
+    const renderLine = (id: string, prefix: string, th: any) => {
+      const c = configs.get(id);
+      const st = stats.get(id)!;
+      const isFull = c?.autoLoad === "all" || id === "full";
+      const bits: string[] = [`工具${st.tools}`, st.skills === "all" ? "技能全部" : `技能${st.skills}`, `包${st.packages}`];
+      let colored: string;
+      if (id === current) colored = th.fg("accent", th.bold(`● ${id}`));
+      else if (isFull) colored = th.fg("success", `◆ ${id}`);
+      else colored = th.fg("text", `○ ${id}`);
+      const namePart = c?.name ? th.fg("muted", `  ${c.name}`) : id === "default" ? th.fg("muted", "  默认（最小）") : id === "full" ? th.fg("muted", "  全功能") : "";
+      const inh = c?.inherit;
+      const inheritNote = typeof inh === "string" && !validParent(inh)
+        ? th.fg("warning", `  ← ${inh}（缺失/内置，视作根）`)
+        : "";
+      const warn = warningsByMode.get(id) ?? [];
+      const warnNote = warn.length ? th.fg("warning", `  ⚠️${warn.length}`) : "";
+      line(`${prefix}${colored}${namePart}${th.fg("dim", ` · ${bits.join(" ")}`)}${inheritNote}${warnNote}`);
+    };
+
+    const rendered = new Set<string>(); // 循环继承防无限递归
+    const walk = (id: string, prefix: string, isLast: boolean, isRoot: boolean) => {
+      if (rendered.has(id)) return;
+      rendered.add(id);
+      const kids = childrenOf.get(id) ?? [];
+      renderLine(id, prefix, theme ?? dummyTheme);
+      kids.forEach((kid, i) => {
+        const last = i === kids.length - 1;
+        const childPrefix = isRoot ? (last ? "  └─ " : "  ├─ ") : isLast ? `${prefix}   └─ ` : `${prefix}   ├─ `;
+        walk(kid, childPrefix, last, false);
+      });
+    };
+    walk("default", "  ", true, true);
+    if (!childrenOf.get("default")?.length) walk("full", "  ", true, true);
+    else walk("full", "  ", true, true);
+    for (const r of roots) walk(r, "  ", true, true);
+    if (diagnostics.length) {
+      line("");
+      line(theme?.fg?.("warning", "⚠️ 诊断:") ?? "⚠️ 诊断:");
+      for (const d of diagnostics) line(theme?.fg?.("warning", `  ${d}`) ?? `  ${d}`);
+    }
+    line("");
+    const diagNote = diagnostics.length ? ` · ⚠️${diagnostics.length} 条诊断` : "";
+    line(theme?.fg?.("dim", `  当前: ${current ?? "默认（最小）"}${diagNote} · ●=当前 ◆=full · /mode clear 关闭面板`) ?? `  当前: ${current ?? "默认（最小）"}${diagNote}`);
+    return lines;
+  }
+
+  async function showModes(ctx: ExtensionCommandContext) {
+      syncProjectTrust(ctx);
+      const cwd = ctx.cwd;
+      // 活体面板在 render 时重新采集，这里只捕获稳定的采集依赖
+      const readCurrent = () => readCurrentFromBranchCompat(ctx);
       let tui: any = null;
       try {
         tui = await import("@earendil-works/pi-tui");
       } catch { /* 回退纯文本 */ }
 
-      const renderLine = (id: string, prefix: string, theme: any, line: (s: string) => void) => {
-        const c = configs.get(id);
-        const st = stats.get(id)!;
-        const isFull = c?.autoLoad === "all" || id === "full";
-        const bits: string[] = [`工具${st.tools}`, st.skills === "all" ? "技能全部" : `技能${st.skills}`, `包${st.packages}`];
-        let colored: string;
-        if (id === current) colored = theme.fg("accent", theme.bold(`● /${id}`));
-        else if (isFull) colored = theme.fg("success", `◆ /${id}`);
-        else colored = theme.fg("text", `○ /${id}`);
-        const namePart = c?.name ? theme.fg("muted", `  ${c.name}`) : id === "default" ? theme.fg("muted", "  默认（最小）") : id === "full" ? theme.fg("muted", "  全功能") : "";
-        const inh = c?.inherit;
-        const inheritNote = typeof inh === "string" && !validParent(inh)
-          ? theme.fg("warning", `  ← ${inh}（缺失/内置，视作根）`)
-          : "";
-        const warn = warningsByMode.get(id) ?? [];
-        const warnNote = warn.length ? theme.fg("warning", `  ⚠️${warn.length}`) : "";
-        line(`${prefix}${colored}${namePart}${theme.fg("dim", ` · ${bits.join(" ")}`)}${inheritNote}${warnNote}`);
-      };
-
-      const buildLines = (line: (s: string) => void, theme?: any) => {
-        const rendered = new Set<string>(); // 循环继承防无限递归
-        const walk = (id: string, prefix: string, isLast: boolean, isRoot: boolean) => {
-          if (rendered.has(id)) return;
-          rendered.add(id);
-          const kids = childrenOf.get(id) ?? [];
-          renderLine(id, prefix, theme ?? dummyTheme, line);
-          kids.forEach((kid, i) => {
-            const last = i === kids.length - 1;
-            const childPrefix = isRoot ? (last ? "  └─ " : "  ├─ ") : isLast ? `${prefix}   └─ ` : `${prefix}   ├─ `;
-            walk(kid, childPrefix, last, false);
-          });
-        };
-        walk("default", "  ", true, true);
-        if (!childrenOf.get("default")?.length) walk("full", "  ", true, true);
-        else walk("full", "  ", true, true);
-        for (const r of roots) walk(r, "  ", true, true);
-        if (diagnostics.length) {
-          line("");
-          line(theme?.fg?.("warning", "⚠️ 诊断:") ?? "⚠️ 诊断:");
-          for (const d of diagnostics) line(theme?.fg?.("warning", `  ${d}`) ?? `  ${d}`);
-        }
-        line("");
-        line(theme?.fg?.("dim", `  当前: ${current ?? "默认（最小）"} · ●=当前 ◆=full · /modes clear 关闭面板`) ?? `  当前: ${current ?? "默认（最小）"}`);
-      };
-
       if (tui?.Container && tui?.Text) {
-        const { Container, Text } = tui;
-        ctx.ui.setWidget("modes", (_t: any, theme: any) => {
-          const container = new Container();
-          buildLines((s) => container.addChild(new Text(s, 0, 0)), theme);
-          return container;
-        });
+        ctx.ui.setWidget("modes", (t: any, theme: any) =>
+          liveWidget(t, cwd, () => buildModesLines(collectModesData(pi, cwd, readCurrent), theme)));
       } else {
-        const lines: string[] = ["📂 模式:"];
-        buildLines((s) => lines.push(s));
+        const lines = ["📂 模式:", ...buildModesLines(collectModesData(pi, cwd, readCurrent))];
         ctx.ui.setWidget("modes", lines);
       }
-      ctx.ui.notify(`共 ${modeIds.length} 个模式${diagnostics.length ? `，${diagnostics.length} 条诊断` : ""}`, diagnostics.length ? "warning" : "info");
-    },
-  });
+      const data = collectModesData(pi, cwd, readCurrent);
+      ctx.ui.notify(`共 ${data.modeIds.length} 个模式${data.diagnostics.length ? `，${data.diagnostics.length} 条诊断` : ""}`, data.diagnostics.length ? "warning" : "info");
+  }
 
   function readCurrentFromBranchCompat(ctx: any): string | null {
     try {
@@ -651,10 +732,8 @@ export default function (pi: ExtensionAPI) {
     return null;
   }
 
-  // ---------- /cleanup：清理孤儿包引用（含包管理的资源） ----------
-  pi.registerCommand("cleanup", {
-    description: "清理模式中对已卸载包的引用及其管理的资源",
-    handler: async (_args, ctx) => {
+  // ---------- /mode cleanup：清理孤儿包引用（含包管理的资源） ----------
+  async function cmdCleanup(_args: string, ctx: ExtensionCommandContext) {
       if (!hasUI(ctx)) return;
       syncProjectTrust(ctx);
       const ids = scanModes(ctx.cwd);
@@ -679,8 +758,7 @@ export default function (pi: ExtensionAPI) {
         refreshIfCurrent(pi, ctx, id);
       }
       ctx.ui.notify(`✅ 已清理 ${cleaned} 处孤儿引用；残留扩展代码需 /reload 清除`, "info");
-    },
-  });
+  }
 
   /** 从模式中移除某个包及其管理的资源（owner-aware，手动资源保留）。返回清理条数。 */
   function removePackageResources(c: ModeConfig, pkgSource: string): number {
@@ -734,10 +812,8 @@ export default function (pi: ExtensionAPI) {
     return count;
   }
 
-  // ---------- /delmode：作用域选择 + 顺延 + 当前模式回落 ----------
-  pi.registerCommand("delmode", {
-    description: "删除模式（同名分作用域选择；子模式顺延；当前模式回落默认）",
-    handler: async (args, ctx) => {
+  // ---------- /mode del：删除模式（作用域选择 + 顺延 + 当前模式回落） ----------
+  async function cmdDelMode(args: string, ctx: ExtensionCommandContext) {
       if (!hasUI(ctx)) return;
       syncProjectTrust(ctx);
       const ids = scanModes(ctx.cwd);
@@ -748,15 +824,16 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`❌ 模式「${id}」不存在`, "error");
         return;
       }
-      if (RESERVED.includes(id)) {
-        if (id === "full") {
-          const ok = await ctx.ui.confirm("删除 full.json", "full 是内置模式，删除后 /full 仍可用（内置兜底）。删除 full.json?", );
-          if (!ok) return;
-          const p = join(globalModesDir, "full.json");
-          if (existsSync(p)) rmSync(p);
-          ctx.ui.notify("✅ 已删除 full.json（/full 仍以内置配置可用）", "info");
-          return;
-        }
+      if (id === "full") {
+        const ok = await ctx.ui.confirm("删除 full.json", "full 是内置模式，删除后 /mode use full 仍可用（内置兜底）。删除 full.json?", );
+        if (!ok) return;
+        const p = join(globalModesDir, "full.json");
+        if (existsSync(p)) rmSync(p);
+        bumpRuntimeRev();
+        ctx.ui.notify("✅ 已删除 full.json（/mode use full 仍以内置配置可用）", "info");
+        return;
+      }
+      if (id === "default") {
         ctx.ui.notify(`❌ ${id} 是内置模式，不能删除`, "error");
         return;
       }
@@ -809,6 +886,7 @@ export default function (pi: ExtensionAPI) {
           saveModeConfig(child, ctx.cwd, c);
         }
       }
+      bumpRuntimeRev(); // /mode show 树实时移除节点、顺延继承
 
       if (isCurrent) {
         const msg = applyMode(pi, ctx, "default");
@@ -816,16 +894,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `✅ 已删除 ${id}${children.length ? `，${children.join(", ")} 已顺延` : ""}${isCurrent ? "，当前已回落默认" : ""}。旧命令 /${id} 需 /reload 后从补全中移除`,
+        `✅ 已删除 ${id}${children.length ? `，${children.join(", ")} 已顺延` : ""}${isCurrent ? "，当前已回落默认" : ""}`,
         "info",
       );
-    },
-  });
+  }
 
-  // ---------- /editmode：编辑模式（立即生效；full 可编辑不可删） ----------
-  pi.registerCommand("editmode", {
-    description: "编辑模式（重新走向导，预填当前值，保存后立即生效）",
-    handler: async (args, ctx) => {
+  // ---------- /mode edit：编辑模式（立即生效；full 可编辑不可删） ----------
+  async function cmdEditMode(args: string, ctx: ExtensionCommandContext) {
       if (!hasUI(ctx)) return;
       syncProjectTrust(ctx);
       const ids = scanModes(ctx.cwd);
@@ -834,10 +909,6 @@ export default function (pi: ExtensionAPI) {
       if (!id) return;
       if (!ids.includes(id) && id !== "full") {
         ctx.ui.notify(`❌ 模式「${id}」不存在`, "error");
-        return;
-      }
-      if (RESERVED.includes(id) && id !== "full") {
-        ctx.ui.notify(`❌ ${id} 是内置模式，不能编辑`, "error");
         return;
       }
       const isFull = id === "full";
@@ -855,6 +926,7 @@ export default function (pi: ExtensionAPI) {
         if (prompt === undefined) return;
         const saved: ModeConfig = { ...config, name, systemPrompt: prompt };
         if (writeJson(join(globalModesDir, "full.json"), { ...saved, schemaVersion: 2 })) {
+          bumpRuntimeRev();
           ctx.ui.notify("✅ 已保存 full.json，下次请求生效", "info");
         } else ctx.ui.notify("❌ 保存失败", "error");
         return;
@@ -865,7 +937,7 @@ export default function (pi: ExtensionAPI) {
       if (!name) return;
 
       // 父模式
-      const modeIds = scanModes(ctx.cwd).filter((m) => !RESERVED.includes(m) && m !== id);
+      const modeIds = scanModes(ctx.cwd).filter((m) => m !== "full" && m !== id);
       const parent = await ctx.ui.select("父模式 (继承):", ["无（独立模式）", "default（虚拟根模式）", ...modeIds]);
       if (!parent) return;
       const parentId = parent.startsWith("无") ? null : parent.startsWith("default") ? "default" : parent;
@@ -896,9 +968,26 @@ export default function (pi: ExtensionAPI) {
       const packages = await settingsMultiSelect(ctx, "挂载包", pkgLabels, config.packages ?? []);
       if (packages === null) return;
       const chosenPkgs = pkgList.filter((p) => packages.includes(p.source));
+      // 仅新挂载的包自动预勾：已挂载包的手动取消保持不动，避免覆盖用户之前的选择。
+      const prevPackages = new Set(previousConfig.packages ?? []);
+      const newPkgs = chosenPkgs.filter((p) => !prevPackages.has(p.source));
+      if (newPkgs.length > 0) {
+        const probeTools = new Set(newPkgs.flatMap((p) => packageToolNames(pi, p, ctx.cwd)));
+        const probeSkills = newPkgs.flatMap((p) => inspectPackage(p.source, ctx.cwd).skills);
+        const probePrompts = packagePromptRefs(newPkgs, ctx.cwd);
+        ctx.ui.notify(
+          probeTools.size + probeSkills.length + probePrompts.length > 0
+            ? `📦 新挂载包的工具/技能/提示已自动预勾，可在后续步骤再取消` 
+            : `⚠️ 新挂载的包暂无可注册工具/技能/提示，仅记录包引用`,
+          "info",
+        );
+      }
 
-      // 工具（预填，过滤核心 4）
-      const preTools = (config.addTools ?? []).filter((t) => !DEFAULT_TOOLS.includes(t));
+      // 工具（预填旧值 + 新包工具，过滤核心 4）
+      const preTools = [...new Set([
+        ...(config.addTools ?? []).filter((t) => !DEFAULT_TOOLS.includes(t)),
+        ...newPkgs.flatMap((p) => packageToolNames(pi, p, ctx.cwd)),
+      ])];
       const tools = await settingsMultiSelect(ctx, "工具（核心 4 工具固定）", toolOptions(pi), preTools);
       if (tools === null) return;
 
@@ -915,7 +1004,14 @@ export default function (pi: ExtensionAPI) {
           }
         }
       }
-      const preSkills = (config.addSkills ?? []).map(skillRefKey);
+      const preSkills = [...new Set([
+        ...(config.addSkills ?? []).map(skillRefKey),
+        ...newPkgs.flatMap((p) =>
+          inspectPackage(p.source, ctx.cwd).skills.map((s) =>
+            skillRefKey({ scope: "package", package: p.source, name: s } as SkillRef),
+          ),
+        ),
+      ])];
       const skills = await settingsMultiSelect(ctx, "技能", skillItems, preSkills);
       if (skills === null) return;
 
@@ -928,7 +1024,11 @@ export default function (pi: ExtensionAPI) {
           promptItems.push({ value: key, label: `${r.package ?? "(无包)"}/${r.name}${r.package ? "" : "（未安装）"}` });
         }
       }
-      const prompts = await settingsMultiSelect(ctx, "提示模板（/reload 后生效）", promptItems, (config.prompts ?? []).map(promptRefKey));
+      const prePrompts = [...new Set([
+        ...(config.prompts ?? []).map(promptRefKey),
+        ...packagePromptRefs(newPkgs, ctx.cwd).map(promptRefKey),
+      ])];
+      const prompts = await settingsMultiSelect(ctx, "提示模板（/reload 后生效）", promptItems, prePrompts);
       if (prompts === null) return;
 
       // 系统提示词
@@ -957,30 +1057,23 @@ export default function (pi: ExtensionAPI) {
         if (!ok) return ctx.ui.notify("已取消迁移", "info");
       }
       if (!writeJson(targetPath, newConfig)) return ctx.ui.notify("❌ 保存失败", "error");
+      bumpRuntimeRev();
       if (targetLoc !== curLoc) {
         for (const p of [join(globalModesDir, `${id}.json`), join(projectModesDir(ctx.cwd), `${id}.json`)]) {
           if (p !== targetPath && existsSync(p)) rmSync(p);
         }
       }
 
-      // 命令注册（新建命令或覆盖描述）
-      registerModeCommandShared(pi, id, `切换到模式 ${id}`, async (_args2, ctx2) => {
-        const msg = applyMode(pi, ctx2, id);
-        ctx2.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
-      });
       refreshIfCurrent(pi, ctx, id);
       const hasPrompts = (newConfig.prompts ?? []).length > 0;
       ctx.ui.notify(
         `✅ 已保存 ${id}（${targetLoc === "global" ? "全局" : "项目级"}）${hasPrompts ? "；提示模板需 /reload 生效" : ""}`,
         "info",
       );
-    },
-  });
+  }
 
-  // ---------- /link：挂载包/资源（整包 / 单工具 / 单技能 / 单提示） ----------
-  pi.registerCommand("link", {
-    description: "挂载包或包内单个工具/技能/提示模板到某个模式",
-    handler: async (args, ctx) => {
+  // ---------- /link add：挂载包/资源（整包 / 单工具 / 单技能 / 单提示） ----------
+  async function cmdLink(args: string, ctx: ExtensionCommandContext) {
       if (!hasUI(ctx)) return;
       syncProjectTrust(ctx);
       const pkgList = listInstalledPackages(ctx.cwd);
@@ -1019,8 +1112,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ③ 目标模式
-      const modeIds = scanModes(ctx.cwd).filter((m) => !RESERVED.includes(m));
-      if (modeIds.length === 0) return ctx.ui.notify("没有模式，先 /addmode 创建", "warning");
+      const modeIds = scanModes(ctx.cwd).filter((m) => m !== "full");
+      if (modeIds.length === 0) return ctx.ui.notify("没有模式，先 /mode add 创建", "warning");
       const mode = await ctx.ui.select("挂载到哪个模式?", modeIds);
       if (!mode) return;
       const config = loadModeConfig(mode, ctx.cwd);
@@ -1042,7 +1135,7 @@ export default function (pi: ExtensionAPI) {
         const existsInList = allList.includes(key);
         if (existsInList) {
           // 已存在但不是本包挂载：只追加 owner 记录，不重复添加；
-          // 同时登记 __manual__ 手动来源声明，保证 unlink/cleanup 不误删原配置（决策 Q7/A）
+          // 同时登记 __manual__ 手动来源声明，保证 link del/mode cleanup 不误删原配置（决策 Q7/A）
           const manual = (managed["__manual__"] ??= {});
           const manualList: any[] = kind === "tools" ? (manual.tools ??= []) : kind === "skills" ? ((manual.skills ??= []) as any) : ((manual.prompts ??= []) as any);
           const manualKeys = manualList.map((x: any) => (kind === "tools" ? x : JSON.stringify(x)));
@@ -1140,70 +1233,95 @@ export default function (pi: ExtensionAPI) {
       } else {
         ctx.ui.notify("❌ 写入失败", "error");
       }
-    },
-  });
+  }
 
-  // ---------- /linked：挂载关系面板 ----------
-  pi.registerCommand("linked", {
-    description: "查看所有模式挂载了哪些包/工具/技能/提示模板",
-    handler: async (args, ctx) => {
-      if (args === "clear") {
-        ctx.ui.setWidget("linked", undefined);
-        return;
+  // ---------- /link show：挂载关系面板（命令与活体面板共用） ----------
+  /** 每次调用都重新扫描磁盘，返回有配置的模式行。 */
+  function collectLinkedRows(cwd: string): { id: string; c: ModeConfig }[] {
+    return scanModes(cwd)
+      .map((id) => ({ id, c: loadModeConfig(id, cwd) }))
+      .filter((r): r is { id: string; c: ModeConfig } => !!r.c);
+  }
+
+  function buildLinkedLines(rows: { id: string; c: ModeConfig }[], theme?: any): string[] {
+    const lines: string[] = [];
+    const addChild = (s: string) => lines.push(s);
+    addChild(theme?.fg?.("accent", theme?.bold?.("🔗 挂载关系")) ?? "🔗 挂载关系:");
+    for (const { id, c } of rows) {
+      const whole = new Set(c.packages ?? []);
+      const managed = c.managedResources ?? {};
+      // 按包归组单独挂载的资源；整包挂载的只显示 📦（整包），不再展开包内明细
+      const perPkg = new Map<string, string[]>();
+      const own = (pkg: string | null, item: string) => {
+        const key = pkg ?? "__manual__";
+        let list = perPkg.get(key);
+        if (!list) { list = []; perPkg.set(key, list); }
+        list.push(item);
+      };
+      for (const [pkg, res] of Object.entries(managed)) {
+        if (pkg === "__manual__" || whole.has(pkg)) continue;
+        for (const t of res.tools ?? []) own(pkg, `🔧 ${t}`);
+        for (const s of res.skills ?? []) own(pkg, `🎯 ${s.name}`);
+        for (const p of res.prompts ?? []) own(pkg, `📝 ${p.name}`);
       }
-      const modeIds = scanModes(ctx.cwd);
-      if (modeIds.length === 0) return ctx.ui.notify("没有模式，先 /addmode 创建", "warning");
-      const rows = modeIds
-        .map((id) => ({ id, c: loadModeConfig(id, ctx.cwd) }))
-        .filter((r): r is { id: string; c: ModeConfig } => !!r.c);
+      // 无 owner 记录的资源按手动资源归组（包括被整包覆盖的：由整包行代表，不重复）
+      const ownedBy = (pred: (r: ManagedPackageResources) => boolean) => Object.values(managed).some(pred);
+      for (const t of c.addTools ?? []) {
+        if (!ownedBy((r) => (r.tools ?? []).includes(t))) own(null, `🔧 ${t}`);
+      }
+      for (const s of c.addSkills ?? []) {
+        const key = JSON.stringify(s);
+        if (!ownedBy((r) => (r.skills ?? []).some((x) => JSON.stringify(x) === key)))
+          own(null, s.scope === "package" && s.package ? `🎯 ${s.package}/${s.name}` : `🎯 ${s.name}（${s.scope}）`);
+      }
+      for (const p of c.prompts ?? []) {
+        const key = JSON.stringify(p);
+        if (!ownedBy((r) => (r.prompts ?? []).some((x) => JSON.stringify(x) === key)))
+          own(null, `📝 ${p.package ? `${p.package}/${p.name}` : p.name}`);
+      }
+      if (whole.size === 0 && perPkg.size === 0) continue;
+      addChild(theme?.fg?.("text", `  ${id}`) ?? `  ${id}`);
+      for (const p of c.packages ?? []) addChild(`    📦 ${p}（整包）`);
+      for (const [pkg, items] of perPkg) {
+        if (items.length === 0) continue;
+        if (pkg === "__manual__") addChild(`    ${items.join(" · ")}`);
+        else addChild(`    📦 ${pkg} → ${items.join(" · ")}`);
+      }
+    }
+    return lines;
+  }
+
+  async function showLinked(ctx: ExtensionCommandContext) {
+      const cwd = ctx.cwd;
+      const rows = collectLinkedRows(cwd);
+      if (rows.length === 0) return ctx.ui.notify("没有模式，先 /mode add 创建", "warning");
       const hasAny = rows.some((r) =>
         (r.c.packages?.length ?? 0) + (r.c.addTools?.length ?? 0) + (r.c.addSkills?.length ?? 0) + (r.c.prompts?.length ?? 0) > 0,
       );
-      if (!hasAny) return ctx.ui.notify("暂无挂载，用 /link 添加", "warning");
+      if (!hasAny) return ctx.ui.notify("暂无挂载，用 /link add 添加", "warning");
 
       let tui: any = null;
       try {
         tui = await import("@earendil-works/pi-tui");
       } catch { /* 回退 */ }
 
-      const buildLines = (addChild: (s: string) => void, theme?: any) => {
-        addChild(theme?.fg?.("accent", theme?.bold?.("🔗 挂载关系")) ?? "🔗 挂载关系:");
-        for (const { id, c } of rows) {
-          if (!(c.packages?.length ?? 0) && !(c.addSkills?.length ?? 0) && !(c.prompts?.length ?? 0) && !(c.addTools?.length ?? 0)) continue;
-          addChild(theme?.fg?.("text", `  /${id}`) ?? `  /${id}`);
-          for (const p of c.packages ?? []) addChild(`    📦 ${p}`);
-          for (const t of c.addTools ?? []) addChild(`    🔧 ${t}`);
-          for (const s of c.addSkills ?? []) addChild(`    🎯 ${s.scope === "package" ? `${s.package}/${s.name}` : `${s.name}（${s.scope}）`}`);
-          for (const p of c.prompts ?? []) addChild(`    📝 ${p.package ? `${p.package}/${p.name}` : p.name}（/reload 生效）`);
-        }
-      };
-
       if (tui?.Container && tui?.Text) {
-        const { Container, Text } = tui;
-        ctx.ui.setWidget("linked", (_t: any, theme: any) => {
-          const container = new Container();
-          buildLines((s) => container.addChild(new Text(s, 0, 0)), theme);
-          return container;
-        });
+        ctx.ui.setWidget("linked", (t: any, theme: any) =>
+          liveWidget(t, cwd, () => buildLinkedLines(collectLinkedRows(cwd), theme)));
       } else {
-        const lines: string[] = [];
-        buildLines((s) => lines.push(s));
-        ctx.ui.setWidget("linked", lines);
+        ctx.ui.setWidget("linked", buildLinkedLines(rows));
       }
-      ctx.ui.notify("✅ 已更新挂载面板（/linked clear 关闭）", "info");
-    },
-  });
+      ctx.ui.notify("✅ 已更新挂载面板（/link clear 关闭）", "info");
+  }
 
-  // ---------- /unlink：解除挂载（参数 + 向导；owner-aware 级联） ----------
-  pi.registerCommand("unlink", {
-    description: "从模式移除已挂载的包/工具/技能/提示模板（整包级联清理其资源）",
-    handler: async (args, ctx) => {
+  // ---------- /link del：解除挂载（参数 + 向导；owner-aware 级联） ----------
+  async function cmdUnlink(args: string, ctx: ExtensionCommandContext) {
       if (!hasUI(ctx)) return;
       syncProjectTrust(ctx);
       const modeIds = scanModes(ctx.cwd);
       if (modeIds.length === 0) return ctx.ui.notify("没有模式", "warning");
 
-      // 参数形式：/unlink <pkg> → 查找挂载该包的模式
+      // 参数形式：/link del <pkg> → 查找挂载该包的模式
       let mode: string | undefined;
       let targetPkg: string | undefined;
       if (args) {
@@ -1265,7 +1383,7 @@ export default function (pi: ExtensionAPI) {
         const owners = Object.entries(config.managedResources ?? {}).filter(([p, v]) => p !== "__manual__" && (v.tools ?? []).includes(t));
         const manual = (config.managedResources?.__manual__?.tools ?? []).includes(t);
         if (owners.length > 1) {
-          return ctx.ui.notify(`⚠️ ${t} 由多个包拥有，请使用 /unlink <pkg> 逐个解除`, "warning");
+          return ctx.ui.notify(`⚠️ ${t} 由多个包拥有，请使用 /link del <pkg> 逐个解除`, "warning");
         }
         if (!manual) {
           config.addTools = (config.addTools ?? []).filter((x) => x !== t);
@@ -1279,7 +1397,7 @@ export default function (pi: ExtensionAPI) {
         const key = skillRefKey(ref);
         const owners = Object.entries(config.managedResources ?? {}).filter(([p, v]) => p !== "__manual__" && (v.skills ?? []).some((x) => skillRefKey(x) === key));
         const manual = (config.managedResources?.__manual__?.skills ?? []).some((x) => skillRefKey(x) === key);
-        if (owners.length > 1) return ctx.ui.notify(`⚠️ ${ref.name} 由多个包拥有，请使用 /unlink <pkg> 逐个解除`, "warning");
+        if (owners.length > 1) return ctx.ui.notify(`⚠️ ${ref.name} 由多个包拥有，请使用 /link del <pkg> 逐个解除`, "warning");
         if (!manual) {
           config.addSkills = (config.addSkills ?? []).filter((x) => skillRefKey(x) !== key);
           if (config.addSkills.length === 0) delete config.addSkills;
@@ -1292,7 +1410,7 @@ export default function (pi: ExtensionAPI) {
         const key = promptRefKey(ref);
         const owners = Object.entries(config.managedResources ?? {}).filter(([p, v]) => p !== "__manual__" && (v.prompts ?? []).some((x) => promptRefKey(x) === key));
         const manual = (config.managedResources?.__manual__?.prompts ?? []).some((x) => promptRefKey(x) === key);
-        if (owners.length > 1) return ctx.ui.notify(`⚠️ ${ref.name} 由多个包拥有，请使用 /unlink <pkg> 逐个解除`, "warning");
+        if (owners.length > 1) return ctx.ui.notify(`⚠️ ${ref.name} 由多个包拥有，请使用 /link del <pkg> 逐个解除`, "warning");
         if (!manual) {
           config.prompts = (config.prompts ?? []).filter((x) => promptRefKey(x) !== key);
           if (config.prompts.length === 0) delete config.prompts;
@@ -1313,6 +1431,205 @@ export default function (pi: ExtensionAPI) {
           : item.startsWith("🎯 ") ? "（下次请求生效）"
           : item.startsWith("📝 ") ? "（需 /reload 后消失）" : "";
         ctx.ui.notify(`✅ 已从 /${mode} 移除 ${item.slice(0, 40)}${eff}`, "info");
+      }
+  }
+
+  // ---------- /mode 与 /link：子命令分发 + 两级补全 ----------
+  type Sub = { value: string; label: string; description: string };
+  type CompletionItem = { value: string; label: string; description?: string };
+
+  const MODE_SUBS: Sub[] = [
+    { value: "show", label: "show", description: "打开模式面板" },
+    { value: "clear", label: "clear", description: "关闭模式面板" },
+    { value: "use", label: "use", description: "切换模式（/mode use <id>）" },
+    { value: "add", label: "add", description: "创建模式（向导）" },
+    { value: "edit", label: "edit", description: "编辑模式（/mode edit <id>）" },
+    { value: "del", label: "del", description: "删除模式（/mode del <id>）" },
+    { value: "init", label: "init", description: "生成/修复 full.json 模板" },
+    { value: "cleanup", label: "cleanup", description: "清理已卸载包的引用" },
+  ];
+
+  const LINK_SUBS: Sub[] = [
+    { value: "add", label: "add", description: "挂载包/工具/技能/提示到模式（/link add <pkg>）" },
+    { value: "del", label: "del", description: "解除挂载（/link del <pkg>）" },
+    { value: "show", label: "show", description: "打开挂载关系面板" },
+    { value: "clear", label: "clear", description: "关闭挂载面板" },
+  ];
+
+  function completionCwd(): string | null {
+    const cwd = runtime.cwd;
+    return typeof cwd === "string" && cwd ? cwd : null;
+  }
+
+  /**
+   * 两级补全：argumentText 是命令名之后的完整参数文本，返回 item.value 会整体替换它。
+   * - 无尾随空格且 ≤1 个 token → 过滤第一级子命令
+   * - 尾随空格 / 2 个 token → 进入第二级（secondLevel 返回的 value 已带「子命令 」前缀）
+   */
+  function subcommandCompletions(
+    argumentText: string,
+    subs: Sub[],
+    secondLevel: (sub: string) => CompletionItem[] | null,
+  ): CompletionItem[] | null {
+    try {
+      const trailing = /\s$/.test(argumentText);
+      const tokens = argumentText.trim().split(/\s+/).filter(Boolean);
+      if (!trailing && tokens.length <= 1) {
+        const prefix = tokens[0] ?? "";
+        const filtered = subs.filter((s) => s.value.startsWith(prefix));
+        return filtered.length > 0 ? filtered : null;
+      }
+      if (tokens.length === 0) return subs;
+      const sub = tokens[0];
+      if (!subs.some((s) => s.value === sub)) return null;
+      const rest = trailing ? "" : (tokens[1] ?? "");
+      const items = secondLevel(sub) ?? [];
+      const filtered = items.filter((i) => i.value.slice(sub.length + 1).startsWith(rest));
+      return filtered.length > 0 ? filtered : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** /mode use|edit|del 的第二级候选：实时扫描模式文件，新配置免 reload 即可补全。 */
+  function modeIdCompletions(sub: string): CompletionItem[] | null {
+    const cwd = completionCwd();
+    if (!cwd || !(sub === "use" || sub === "edit" || sub === "del")) return null;
+    // scanModes 已含 full.json（用户可 /mode init 生成），与内置 full 去重
+    const ids = sub === "del"
+      ? [...new Set(["full", ...scanModes(cwd)])]
+      : [...new Set(["default", "full", ...scanModes(cwd)])];
+    const items = ids.map((id) => {
+      const c = id === "default" ? null : loadModeConfig(id, cwd);
+      const name = id === "default" ? "默认（最小）" : (c?.name ?? (id === "full" ? "全功能" : id));
+      return { value: `${sub} ${id}`, label: id, description: name };
+    });
+    return items.length > 0 ? items : null;
+  }
+
+  // /link add 的包扫描较重（node_modules 遍历 + manifest 读取），用短 TTL memo 平滑连续按键
+  const PKG_CACHE_TTL = 2000;
+  let pkgCache: { key: string; at: number; items: CompletionItem[] } | null = null;
+
+  /** /link add|del 的第二级候选；del 只列当前被任意模式挂载的包。 */
+  function packageCompletions(sub: string): CompletionItem[] | null {
+    const cwd = completionCwd();
+    if (!cwd || (sub !== "add" && sub !== "del")) return null;
+    try {
+      if (sub === "del") {
+        const mounted = new Map<string, string[]>();
+        for (const id of scanModes(cwd)) {
+          const c = loadModeConfig(id, cwd);
+          const pkgs = new Set([
+            ...(c?.packages ?? []),
+            ...Object.keys(c?.managedResources ?? {}).filter((p) => p !== "__manual__"),
+          ]);
+          for (const p of pkgs) {
+            const list = mounted.get(p) ?? [];
+            list.push(id);
+            mounted.set(p, list);
+          }
+        }
+        if (mounted.size === 0) return null;
+        return [...mounted.entries()].map(([p, modes]) => ({
+          value: `del ${p}`,
+          label: p,
+          description: `挂载于 ${modes.join(", ")}`,
+        }));
+      }
+      const now = Date.now();
+      if (pkgCache && pkgCache.key === cwd && now - pkgCache.at < PKG_CACHE_TTL) return pkgCache.items;
+      const items = listInstalledPackages(cwd).map((p) => ({
+        value: `add ${p.source}`,
+        label: p.source,
+        description: `${p.name}${p.scope === "project" ? "（项目）" : "（全局）"}`,
+      }));
+      pkgCache = { key: cwd, at: now, items };
+      return items.length > 0 ? items : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ---------- /mode：模式管理入口 ----------
+  pi.registerCommand("mode", {
+    description: "模式管理：show/clear/use/add/edit/del/init/cleanup（/mode 空格查看子命令）",
+    getArgumentCompletions: (argumentText: string) =>
+      subcommandCompletions(argumentText, MODE_SUBS, modeIdCompletions),
+    handler: async (args, ctx) => {
+      syncProjectTrust(ctx);
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const sub = tokens[0] ?? "show";
+      const rest = tokens.slice(1).join(" ");
+      switch (sub) {
+        case "show":
+          await showModes(ctx);
+          break;
+        case "clear":
+          ctx.ui.setWidget("modes", undefined);
+          break;
+        case "use": {
+          let id = rest;
+          if (!id) {
+            if (!hasUI(ctx)) return;
+            const ids = [...new Set(["default", "full", ...scanModes(ctx.cwd)])];
+            id = (await ctx.ui.select("切换到哪个模式?", ids)) ?? "";
+            if (!id) return;
+          }
+          if (id !== "default" && id !== "full" && !scanModes(ctx.cwd).includes(id)) {
+            ctx.ui.notify(`❌ 模式「${id}」不存在，/mode use 查看可用模式`, "error");
+            return;
+          }
+          const msg = applyMode(pi, ctx, id);
+          ctx.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
+          break;
+        }
+        case "add":
+          await cmdAddMode("", ctx);
+          break;
+        case "edit":
+          await cmdEditMode(rest, ctx);
+          break;
+        case "del":
+          await cmdDelMode(rest, ctx);
+          break;
+        case "init":
+          await cmdInit("", ctx);
+          break;
+        case "cleanup":
+          await cmdCleanup("", ctx);
+          break;
+        default:
+          ctx.ui.notify(`❌ 未知子命令「${sub}」。可用：${MODE_SUBS.map((s) => s.value).join(" / ")}`, "error");
+      }
+    },
+  });
+
+  // ---------- /link：挂载管理入口 ----------
+  pi.registerCommand("link", {
+    description: "挂载管理：add/del/show/clear（/link 空格查看子命令）",
+    getArgumentCompletions: (argumentText: string) =>
+      subcommandCompletions(argumentText, LINK_SUBS, packageCompletions),
+    handler: async (args, ctx) => {
+      syncProjectTrust(ctx);
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const sub = tokens[0] ?? "show";
+      const rest = tokens.slice(1).join(" ");
+      switch (sub) {
+        case "show":
+          await showLinked(ctx);
+          break;
+        case "clear":
+          ctx.ui.setWidget("linked", undefined);
+          break;
+        case "add":
+          await cmdLink(rest, ctx);
+          break;
+        case "del":
+          await cmdUnlink(rest, ctx);
+          break;
+        default:
+          ctx.ui.notify(`❌ 未知子命令「${sub}」。可用：${LINK_SUBS.map((s) => s.value).join(" / ")}`, "error");
       }
     },
   });

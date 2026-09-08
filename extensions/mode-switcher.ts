@@ -1,20 +1,17 @@
 // pi-mode-switcher · 模式切换核心
-// 命令：/full /default + 动态注册用户模式命令
+// 命令：/mode（use 子命令切换，见 mode-manager.ts）+ 模式恢复事件
 // 功能：工具门控、技能块过滤、模式提示词注入、会话级状态持久化、页脚显示
-import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { RESERVED, runtime, loadMode, resolveMode, scanModeFiles } from "../lib/shared.ts";
+import { readFileSync } from "node:fs";
+import { resolveMode, runtime } from "../lib/shared.ts";
 import {
-  applyMode, buildSkillsBlock, collectPromptPaths, computeTools, ensureBridge,
-  readStateFromBranch, registerModeCommandShared, replaceSkillsBlock, saveState,
-  stripSkillsBlock, type ModeBridge,
+  applyMode, buildSkillsBlock, collectPromptPaths, computeTools,
+  readStateFromBranch, replaceSkillsBlock, saveState, stripSkillsBlock,
 } from "../lib/mode-runtime.ts";
 
 const STATE_TYPE = "mode-state";
 
 export default function (pi: ExtensionAPI) {
-  const bridge: ModeBridge = ensureBridge(pi);
-
   // 从会话文件（JSONL）读取最后一个 mode-state entry（fork 恢复用）
   function lastStateFromFile(file: string): string | null {
     try {
@@ -32,45 +29,14 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function registerDynamicCommands(cwd: string) {
-    const { modes } = scanModeFiles(cwd);
-    for (const m of modes) {
-      if (RESERVED.includes(m.id)) continue; // 保留名跳过（full 有内置命令）
-      // 坏配置跳过注册（决策 18），诊断在 /modes 中显示
-      const r = loadMode(m.id, cwd);
-      if (r.broken || !r.config) continue;
-      registerModeCommandShared(pi, m.id, `切换到模式 ${m.id}`, async (_args, ctx) => {
-        const msg = applyMode(pi, ctx, m.id);
-        ctx.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
-      });
-    }
-  }
-
-  // ---------- 内置命令 ----------
-  pi.registerCommand("full", {
-    description: "切换到全功能模式（当前运行时全部已注册工具与技能）",
-    handler: async (_args, ctx) => {
-      const msg = applyMode(pi, ctx, "full");
-      ctx.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
-    },
-  });
-
-  pi.registerCommand("default", {
-    description: "回到默认最小模式（4 个核心工具）",
-    handler: async (_args, ctx) => {
-      const msg = applyMode(pi, ctx, "default");
-      ctx.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
-    },
-  });
-
   // ---------- 事件 ----------
-  // 会话启动：注册动态命令 + 按会话类型恢复模式
-  //   new → 默认最小模式
+  // 会话启动：缓存 cwd（供补全菜单使用）+ 按会话类型恢复模式
+  //   new → 默认模式（8 个内置工具）
   //   fork → 继承原会话模式（读原会话文件最后的 mode-state）
   //   resume/reload/startup → 从当前会话分支恢复
   pi.on("session_start", async (event, ctx) => {
     runtime.projectTrusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : true;
-    registerDynamicCommands(ctx.cwd);
+    runtime.cwd = ctx.cwd;
 
     let restore: string | null = null;
     if (event.reason === "new") {
@@ -118,7 +84,7 @@ export default function (pi: ExtensionAPI) {
     runtime.projectTrusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : runtime.projectTrusted;
     const id = runtime.currentMode ?? "default";
 
-    // 默认最小模式：剥离自动发现技能块，保持最小 token
+    // 默认模式：剥离自动发现技能块，保持最小 token
     if (id === "default") {
       const stripped = stripSkillsBlock(event.systemPrompt);
       return stripped === event.systemPrompt ? undefined : { systemPrompt: stripped };

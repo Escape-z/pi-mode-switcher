@@ -3,58 +3,12 @@
 //       模式应用（即时生效）、技能块重建、模式状态持久化（pi.appendEntry）
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
-  DEFAULT_TOOLS, runtime, resolveMode, resolvePackagePromptPath, resolveSkillPath, parseFrontmatter,
+  DEFAULT_TOOLS, bumpRuntimeRev, runtime, resolveMode, resolvePackagePromptPath, resolveSkillPath, parseFrontmatter,
+  listInstalledPackages,
   type ModeConfig, type SkillRef,
 } from "./shared.ts";
 
 export const STATE_TYPE = "mode-state";
-
-// ---------- 跨扩展桥（Pi 将每个扩展文件加载为独立模块实例，module 级共享不可靠） ----------
-const BRIDGE_KEY = "__piModeSwitcherBridge";
-
-export interface ModeBridge {
-  pi: ExtensionAPI | null;
-  commands: Map<string, { description: string; handler: (args: string, ctx: any) => Promise<void> }>;
-}
-
-function isStale(pi: ExtensionAPI | null): boolean {
-  if (!pi) return true;
-  try {
-    pi.getActiveTools();
-    return false;
-  } catch {
-    return true; // /reload 或会话替换后旧 pi 失效
-  }
-}
-
-export function ensureBridge(pi: ExtensionAPI): ModeBridge {
-  const g = globalThis as any;
-  let b: ModeBridge = g[BRIDGE_KEY];
-  if (!b || isStale(b.pi)) {
-    b = { pi: null, commands: new Map() };
-    g[BRIDGE_KEY] = b;
-  }
-  if (!b.pi) b.pi = pi;
-  return b;
-}
-
-export function getBridge(): ModeBridge | null {
-  const b = (globalThis as any)[BRIDGE_KEY] as ModeBridge | undefined;
-  return b && !isStale(b.pi) ? b : null;
-}
-
-/** 注册模式命令（跨扩展去重：同一 id 只通过桥注册一次，避免 Pi 生成 /id:1 后缀）。 */
-export function registerModeCommandShared(
-  pi: ExtensionAPI,
-  id: string,
-  description: string,
-  handler: (args: string, ctx: any) => Promise<void>,
-): void {
-  const bridge = ensureBridge(pi);
-  if (bridge.commands.has(id)) return;
-  bridge.commands.set(id, { description, handler });
-  bridge.pi?.registerCommand(id, { description, handler });
-}
 
 // ---------- 工具计算 ----------
 function registeredToolNames(pi: ExtensionAPI): Set<string> {
@@ -65,7 +19,7 @@ function registeredToolNames(pi: ExtensionAPI): Set<string> {
   }
 }
 
-/** 计算模式最终工具列表（过滤未注册工具，核心 4 工具固定）。 */
+/** 计算模式最终工具列表（过滤未注册工具，8 个内置工具固定）。 */
 export function computeTools(pi: ExtensionAPI, modeId: string, config: ModeConfig | null): { tools: string[]; unknown: string[] } {
   const registered = registeredToolNames(pi);
   let wanted: string[];
@@ -81,7 +35,7 @@ export function computeTools(pi: ExtensionAPI, modeId: string, config: ModeConfi
   return { tools, unknown };
 }
 
-/** 模式有效资源统计（/modes 页脚使用）。 */
+/** 模式有效资源统计（/mode show 页脚使用）。 */
 export function effectiveStats(
   pi: ExtensionAPI,
   id: string,
@@ -95,7 +49,13 @@ export function effectiveStats(
     try {
       tools = pi.getAllTools().length;
     } catch { /* ignore */ }
-    return { tools, skills: "all", packages: 0, warnings: [] };
+    // full 语义是 autoLoad:"all"（隐式包含运行时全部包），不走 packages[] 列表；
+    // 显示已安装包数，避免树上出现容易误解的 包0。
+    let packages = 0;
+    try {
+      packages = listInstalledPackages(cwd).length;
+    } catch { /* ignore */ }
+    return { tools, skills: "all", packages, warnings: [] };
   }
   const r = resolveMode(id, cwd);
   if (!r.config) return { tools: DEFAULT_TOOLS.length, skills: 0, packages: 0, warnings: r.warnings };
@@ -150,16 +110,17 @@ export function applyMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, modeId
   } else {
     const r = resolveMode(modeId, ctx.cwd);
     if (!r.config) {
-      // 只有当前模式失效时才回落；调用一个已经删除的旧命令不能破坏当前模式。
+      // 只有当前模式失效时才回落；切换到不存在的模式不能破坏当前模式。
       const wasCurrent = runtime.currentMode === modeId;
       if (wasCurrent) {
         runtime.currentMode = "default";
+        bumpRuntimeRev(); // /mode show 高亮等面板需要重绘
         const fb = computeTools(pi, "default", null);
         pi.setActiveTools(fb.tools);
         saveState(pi, "default");
         ctx.ui.setStatus("mode", `default · 工具${fb.tools.length}`);
       }
-      return `❌ 模式「${modeId}」配置无效${wasCurrent ? "，已回落默认模式" : ""}。请修复配置或执行 /reload 刷新命令列表`;
+      return `❌ 模式「${modeId}」配置无效${wasCurrent ? "，已回落默认模式" : ""}。请修复配置或 /mode use 切换其他模式`;
     }
     config = r.config;
     warnings.push(...r.warnings);
@@ -168,6 +129,7 @@ export function applyMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, modeId
   const { tools, unknown } = computeTools(pi, modeId, config);
   pi.setActiveTools(tools); // 全量替换（即时生效）
   runtime.currentMode = modeId;
+  bumpRuntimeRev(); // /modes 高亮实时移动
   saveState(pi, modeId);
   ctx.ui.setStatus("mode", `${modeId} · 工具${tools.length}`);
 
@@ -183,7 +145,11 @@ export function applyMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, modeId
   if (config && config.autoLoad !== "all" && modeId !== "default") {
     parts.push(`工具${tools.length}`, `技能${(config.addSkills ?? []).length}`, `包${(config.packages ?? []).length}`);
   } else if (modeId === "full") {
-    parts.push(`工具${tools.length}`, `技能全部`);
+    let fullPackages = 0;
+    try {
+      fullPackages = listInstalledPackages(ctx.cwd).length;
+    } catch { /* ignore */ }
+    parts.push(`工具${tools.length}`, `技能全部`, `包${fullPackages}`);
   } else {
     parts.push(`工具${tools.length}`);
   }

@@ -20,24 +20,44 @@ export const globalModesDir = join(agentDir, "modes");
 export const skillsDir = join(agentDir, "skills");
 export const globalSettingsFile = join(agentDir, "settings.json");
 
-// 内置保留名（命令冲突防护）
-export const RESERVED = [
-  "full", "default", "link", "linked", "unlink",
-  "init", "addmode", "editmode", "delmode", "modes", "cleanup",
-];
+// 内置保留名（模式 id 不再映射为命令，仅 full 作为可编辑的内置模式保留）
+export const RESERVED = ["full"];
 
-// 默认最小工具集（所有模式固定启用，不写入模式配置）
-export const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
+// 默认内置工具集（所有模式固定启用，不写入模式配置）
+export const DEFAULT_TOOLS = ["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"];
 
 // 模式命令标识规则：小写字母/数字，单个连字符分段
 export const MODE_ID_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 // 进程内运行时状态（当前模式 id；/modes 高亮、before_agent_start 使用）
-export const runtime = {
-  currentMode: null as string | null,
-  // 真实 session_start 会同步项目是否受信任；直接调用默认允许。
-  projectTrusted: true,
-};
+// ⚠️ pi 为每个扩展文件创建独立的 jiti 实例（moduleCache:false），模块级对象跨扩展不共享；
+// 必须挂在 globalThis 上（与 mode-runtime 的 ModeBridge 同一模式），
+// 否则 applyMode（mode-switcher 侧）bump 的 rev，/modes 面板（mode-manager 侧）永远看不到。
+interface RuntimeState {
+  currentMode: string | null;
+  rev: number;
+  projectTrusted: boolean;
+  /** 当前 cwd（session_start / 命令 handler 缓存），供无 ctx 的 getArgumentCompletions 使用 */
+  cwd?: string;
+}
+const RUNTIME_KEY = "__piModeSwitcherRuntime";
+function globalRuntime(): RuntimeState {
+  const g = globalThis as any;
+  if (!g[RUNTIME_KEY]) g[RUNTIME_KEY] = { currentMode: null, rev: 0, projectTrusted: true };
+  return g[RUNTIME_KEY] as RuntimeState;
+}
+export const runtime = new Proxy({ currentMode: null, rev: 0, projectTrusted: true } as RuntimeState, {
+  get: (_t, key) => Reflect.get(globalRuntime(), key),
+  set: (_t, key, value) => {
+    Reflect.set(globalRuntime(), key, value);
+    return true;
+  },
+});
+
+/** 面板实时刷新：变更命令与 applyMode 成功后调用。 */
+export function bumpRuntimeRev(): void {
+  runtime.rev++;
+}
 
 // ---------- 资源引用类型 ----------
 export interface SkillRef {
@@ -305,7 +325,6 @@ export function projectSkillsDir(cwd: string): string {
 function validateModeId(id: string): string | null {
   if (!MODE_ID_RE.test(id)) return `标识「${id}」格式非法（需小写字母/数字，单连字符分段）`;
   if (id === "default") return "default 是虚拟内置模式，其文件会被忽略";
-  if (RESERVED.includes(id) && id !== "full") return `${id} 是内置保留名`;
   return null;
 }
 
@@ -387,14 +406,15 @@ export function loadModeConfig(id: string, cwd: string): ModeConfig | null {
   return loadMode(id, cwd).config;
 }
 
-/** 保存模式配置（标准化为 v2 后写回原位：项目级优先）。 */
+/** 保存模式配置（标准化为 v2 后写回原位：项目级优先）。保存后 bump rev 驱动面板实时刷新。 */
 export function saveModeConfig(id: string, cwd: string, config: ModeConfig): boolean {
   const projectPath = join(projectModesDir(cwd), `${id}.json`);
   const { config: normalized } = normalizeMode(config);
   normalized.schemaVersion = 2;
   if (!normalized.name) normalized.name = id;
-  if (existsSync(projectPath)) return writeJson(projectPath, normalized);
-  return writeJson(join(globalModesDir, `${id}.json`), normalized);
+  const ok = existsSync(projectPath) ? writeJson(projectPath, normalized) : writeJson(join(globalModesDir, `${id}.json`), normalized);
+  if (ok) bumpRuntimeRev();
+  return ok;
 }
 
 // ---------- 继承解析 ----------
@@ -1131,7 +1151,7 @@ export function resolvePackagePromptPath(ref: PromptRef, cwd: string): string | 
   return packageResourceEntries(ref.package, cwd, "prompts").find((x) => x.name === ref.name)?.path ?? null;
 }
 
-/** 扫描本地技能，并保留 global/project 作用域，供 /addmode 和 /editmode 使用。 */
+/** 扫描本地技能，并保留 global/project 作用域，供 /mode add 和 /mode edit 使用。 */
 export function scanSkillRefs(cwd: string): SkillRef[] {
   const result: SkillRef[] = [];
   for (const location of localSkillLocations(cwd)) {

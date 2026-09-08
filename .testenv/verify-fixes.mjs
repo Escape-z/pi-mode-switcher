@@ -171,7 +171,7 @@ runManager(pi2);
   // 确保 modes 目录存在于 AGENT2
   mkdirSync(join(AGENT2, "modes"), { recursive: true });
   try {
-    await pi2.cmd("addmode", "", ctx);
+    await pi2.cmd("mode", "add", ctx);
     check("RPC 下 addmode 不调用 custom", log.customCalled === false, log);
     const loaded = shared.loadMode("rpctest", PROJ2);
     check("RPC 下 addmode 成功创建", !!loaded.config, { loaded, notify: log.notify, agents: globalThis.__AGENT_ROOT__ });
@@ -203,9 +203,9 @@ const mockPiTools = { getAllTools: () => [{name:"read"},{name:"write"},{name:"ed
 const d = runtime2.computeTools(mockPiTools, "default", null);
 const f = runtime2.computeTools(mockPiTools, "full", { autoLoad: "all" });
 const c = runtime2.computeTools(mockPiTools, "java", { addTools: ["web_search"] });
-check("default 固定4工具", d.tools.join() === "read,write,edit,bash", d.tools);
+check("default 固定内置工具（8 个中已注册的）", d.tools.join() === "read,write,edit,bash,ls", d.tools);
 check("full 全量工具", f.tools.length === 6, f.tools);
-check("自定义模式=4+额外", c.tools.join() === "read,write,edit,bash,web_search", c.tools);
+check("自定义模式=内置+额外", c.tools.join() === "read,write,edit,bash,ls,web_search", c.tools);
 
 // ---------- E) 扩展/工具加载正确性 ----------
 console.log("\n== E) 扩展工具加载 ==");
@@ -262,7 +262,7 @@ console.log("\n== C2) TUI 真组件：空格切换 + 回车下一步（无完成
   ]);
   // 包/工具/技能三步多选全部用回车直接通过（保持预勾/空选择）
   try {
-    await pi2.cmd("addmode", "", tuiCtx);
+    await pi2.cmd("mode", "add", tuiCtx);
     const loaded = shared.loadMode("tuimode", PROJ2);
     check("TUI 下回车可完成多选并建出模式", !!loaded.config, { loaded });
     check("渲染中无完成行", renderedHasDoneRow === false);
