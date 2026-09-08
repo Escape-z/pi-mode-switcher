@@ -45,9 +45,7 @@ cd C:/path/to/pi-mode-switcher && npm install
 
 ```bash
 # 或从 GitHub
-
-# 或从 GitHub
-pi install git:github.com/<user>/pi-mode-switcher
+pi install git:github.com/Escape-z/pi-mode-switcher
 ```
 
 ## 模式
