@@ -227,8 +227,16 @@ const getSys = (ret, ev) => (ret ?? []).find((r) => r && r.systemPrompt !== unde
 console.log("\n== 启动（新会话 → 默认最小模式）==");
 await pi.fire("session_start", { reason: "startup" }, ctx);
 check("默认激活 8 个核心工具", pi.activeTools.join() === "read,write,edit,bash,powershell,grep,find,ls", pi.activeTools);
-check("仅注册 /mode 与 /link 两个命令", pi.commands.size === 2 && pi.commands.has("mode") && pi.commands.has("link"), [...pi.commands.keys()]);
+check("注册 /mode、/link 与内置模式别名", pi.commands.size === 4 && pi.commands.has("mode") && pi.commands.has("link") && pi.commands.has("full") && pi.commands.has("default"), [...pi.commands.keys()]);
 check("状态已写入会话 entry（default）", pi.lastState() === "default");
+
+console.log("\n== 直接模式命令 ==");
+await pi.cmd("full", "", ctx);
+check("/full 直接切换模式", pi.lastState() === "full", { state: pi.lastState() });
+await pi.cmd("default", "", ctx);
+check("/default 直接切回默认模式", pi.lastState() === "default", { state: pi.lastState() });
+let inputResult = await pi.fire("input", { text: "/not-a-mode", source: "interactive" }, ctx);
+check("未知 slash 输入不被拦截", inputResult[0]?.action === "continue", inputResult);
 
 console.log("\n== 包扫描（Pi 官方规则，项目级优先）==");
 const pkgs = shared.listInstalledPackages(PROJECT);
@@ -290,6 +298,8 @@ check("默认模式保留基础提示词", getSys(ret, ev).startsWith("BASE_SYS"
 console.log("\n== /java（继承 base→dev→java；append 提示词；渐进式技能）==");
 await pi.cmd("mode", "use java", ctx);
 check("切换成功", lastNotify(ctx).includes("Java"), lastNotify(ctx));
+inputResult = await pi.fire("input", { text: "/java", source: "interactive" }, ctx);
+check("自定义模式也支持直接 /<id>", pi.lastState() === "java" && inputResult[0]?.action === "handled", { state: pi.lastState(), inputResult });
 check("并集工具（核心8+dev+java，去重）", pi.activeTools.join() === "read,write,edit,bash,powershell,grep,find,ls,web_search", pi.activeTools);
 ev = { systemPrompt: SYS_WITH_SKILLS };
 ret = await pi.fire("before_agent_start", ev, ctx);

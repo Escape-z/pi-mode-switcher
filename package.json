@@ -2,8 +2,8 @@
   "name": "pi-mode-switcher",
   "version": "0.1.0",
   "type": "module",
-  "description": "Pi 模式切换系统：按需加载工具/技能/包，节省 token 消耗",
-  "keywords": ["pi-package", "mode", "token", "workflow"],
+  "description": "Task-focused modes for Pi: select the tools, skills, prompts, and package resources relevant to each workflow",
+  "keywords": ["pi-package", "mode", "tools", "skills", "workflow"],
   "scripts": {
     "test": "node .testenv/harness.mjs && node .testenv/verify-fixes.mjs"
   },

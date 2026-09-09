@@ -120,7 +120,7 @@ export function applyMode(pi: ExtensionAPI, ctx: ExtensionCommandContext, modeId
         saveState(pi, "default");
         ctx.ui.setStatus("mode", `default · 工具${fb.tools.length}`);
       }
-      return `❌ 模式「${modeId}」配置无效${wasCurrent ? "，已回落默认模式" : ""}。请修复配置或 /mode use 切换其他模式`;
+      return `❌ 模式「${modeId}」配置无效${wasCurrent ? "，已回落默认模式" : ""}。请修复配置或使用 /<mode-id> 切换模式`;
     }
     config = r.config;
     warnings.push(...r.warnings);

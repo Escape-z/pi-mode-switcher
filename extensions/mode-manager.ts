@@ -397,7 +397,7 @@ export default function (pi: ExtensionAPI) {
       try {
         copyFileSync(template, target);
         bumpRuntimeRev();
-        ctx.ui.notify("✅ 已生成 modes/full.json（/mode use full 即刻可用）", "info");
+        ctx.ui.notify("✅ 已生成 modes/full.json（/full 即刻可用）", "info");
         } catch {
           ctx.ui.notify("❌ 模板复制失败", "error");
         }
@@ -574,7 +574,7 @@ export default function (pi: ExtensionAPI) {
       if (!writeJson(join(dir, `${id}.json`), config)) return ctx.ui.notify("❌ 写入失败", "error");
       bumpRuntimeRev(); // /mode show、/link show 面板实时出现新模式
 
-      ctx.ui.notify(`✅ 模式「${name}」已创建，/mode use ${id} 即可切换${prompts.length > 0 ? "；提示模板需 /reload 生效" : ""}`, "info");
+      ctx.ui.notify(`✅ 模式「${name}」已创建，/${id} 即可切换${prompts.length > 0 ? "；提示模板需 /reload 生效" : ""}`, "info");
   }
 
   // ---------- /modes：数据采集 + 渲染（命令与活体面板共用） ----------
@@ -825,12 +825,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (id === "full") {
-        const ok = await ctx.ui.confirm("删除 full.json", "full 是内置模式，删除后 /mode use full 仍可用（内置兜底）。删除 full.json?", );
+        const ok = await ctx.ui.confirm("删除 full.json", "full 是内置模式，删除后 /full 仍可用（内置兜底）。删除 full.json?", );
         if (!ok) return;
         const p = join(globalModesDir, "full.json");
         if (existsSync(p)) rmSync(p);
         bumpRuntimeRev();
-        ctx.ui.notify("✅ 已删除 full.json（/mode use full 仍以内置配置可用）", "info");
+        ctx.ui.notify("✅ 已删除 full.json（/full 仍以内置配置可用）", "info");
         return;
       }
       if (id === "default") {
@@ -1441,7 +1441,7 @@ export default function (pi: ExtensionAPI) {
   const MODE_SUBS: Sub[] = [
     { value: "show", label: "show", description: "打开模式面板" },
     { value: "clear", label: "clear", description: "关闭模式面板" },
-    { value: "use", label: "use", description: "切换模式（/mode use <id>）" },
+    { value: "use", label: "use", description: "兼容命令：切换模式（推荐直接 /<id>）" },
     { value: "add", label: "add", description: "创建模式（向导）" },
     { value: "edit", label: "edit", description: "编辑模式（/mode edit <id>）" },
     { value: "del", label: "del", description: "删除模式（/mode del <id>）" },
@@ -1551,9 +1551,42 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // ---------- 直接模式命令 ----------
+  // 内置模式注册为真正的 Pi 命令，获得原生补全；动态模式通过 input 事件解析，
+  // 因而新建模式无需 reload 就能使用 /<id> 切换。
+  function registerModeAlias(name: string, id: string) {
+    pi.registerCommand(name, {
+      description: `切换到 ${id} 模式（等价于 /mode use ${id}）`,
+      handler: async (_args, ctx) => {
+        syncProjectTrust(ctx);
+        const msg = applyMode(pi, ctx, id);
+        ctx.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
+      },
+    });
+  }
+
+  registerModeAlias("full", "full");
+  registerModeAlias("default", "default");
+
+  // 模式 ID 是动态配置，无法为每个模式注册一个永久命令；input 事件负责
+  // 处理 /java 等动态模式的单 token 切换。
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") return { action: "continue" };
+    const match = /^\/([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(event.text.trim());
+    if (!match) return { action: "continue" };
+
+    const id = match[1];
+    const known = id === "default" || id === "full" || scanModes(ctx.cwd).includes(id);
+    if (!known) return { action: "continue" };
+
+    const msg = applyMode(pi, ctx, id);
+    ctx.ui.notify(msg, msg.startsWith("❌") ? "error" : "info");
+    return { action: "handled" };
+  });
+
   // ---------- /mode：模式管理入口 ----------
   pi.registerCommand("mode", {
-    description: "模式管理：show/clear/use/add/edit/del/init/cleanup（/mode 空格查看子命令）",
+    description: "模式管理：show/clear/use/add/edit/del/init/cleanup（切换模式也可直接用 /<id>）",
     getArgumentCompletions: (argumentText: string) =>
       subcommandCompletions(argumentText, MODE_SUBS, modeIdCompletions),
     handler: async (args, ctx) => {
@@ -1577,7 +1610,7 @@ export default function (pi: ExtensionAPI) {
             if (!id) return;
           }
           if (id !== "default" && id !== "full" && !scanModes(ctx.cwd).includes(id)) {
-            ctx.ui.notify(`❌ 模式「${id}」不存在，/mode use 查看可用模式`, "error");
+            ctx.ui.notify(`❌ 模式「${id}」不存在，请用 /mode show 查看可用模式`, "error");
             return;
           }
           const msg = applyMode(pi, ctx, id);
@@ -1600,7 +1633,7 @@ export default function (pi: ExtensionAPI) {
           await cmdCleanup("", ctx);
           break;
         default:
-          ctx.ui.notify(`❌ 未知子命令「${sub}」。可用：${MODE_SUBS.map((s) => s.value).join(" / ")}`, "error");
+          ctx.ui.notify(`❌ 未知子命令「${sub}」。可用：${MODE_SUBS.map((s) => s.value).join(" / ")}；切换模式可直接使用 /<id>`, "error");
       }
     },
   });
